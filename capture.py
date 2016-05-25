@@ -9,6 +9,7 @@ import sys
 import contextlib
 
 from maya import cmds
+from maya import mel
 
 version_info = (2, 1, 0)
 
@@ -28,6 +29,8 @@ def capture(camera=None,
             quality=100,
             off_screen=False,
             viewer=True,
+            show_ornaments=True,
+            sound=None,
             isolate=None,
             maintain_aspect_ratio=True,
             overwrite=False,
@@ -54,6 +57,10 @@ def capture(camera=None,
         compression (str, optional): Name of compression, defaults to "h264"
         off_screen (bool, optional): Whether or not to playblast off screen
         viewer (bool, optional): Display results in native player
+        show_ornaments (bool, optional): Whether or not model view ornaments
+            (e.g. axis icon, grid and HUD) should be displayed.
+        sound (str, optional):  Specify the sound node to be used during 
+            playblast. When None (default) no sound will be used.
         isolate (list): List of nodes to isolate upon capturing
         maintain_aspect_ratio (bool, optional): Modify height in order to
             maintain aspect ratio.
@@ -116,6 +123,8 @@ def capture(camera=None,
         playblast_kwargs['completeFilename'] = complete_filename
     if frame:
         playblast_kwargs['frame'] = frame
+    if sound is not None:
+        playblast_kwargs['sound'] = sound
 
     # (#21) Bugfix: `maya.cmds.playblast` suffers from undo bug where it
     # always sets the currentTime to frame 1. By setting currentTime before
@@ -129,6 +138,7 @@ def capture(camera=None,
         cmds.setFocus(panel)
 
         with contextlib.nested(
+             _disabled_inview_messages(),
              _maintain_camera(panel, camera),
              _applied_viewport_options(viewport_options, panel),
              _applied_camera_options(camera_options, panel),
@@ -146,6 +156,7 @@ def capture(camera=None,
                     startTime=start_frame,
                     endTime=end_frame,
                     offScreen=off_screen,
+                    showOrnaments=show_ornaments,
                     forceOverwrite=overwrite,
                     filename=filename,
                     widthHeight=[width, height],
@@ -382,6 +393,16 @@ def parse_view(panel):
 
     # Viewport options
     viewport_options = {}
+    
+    # capture plugin display filters first to ensure we never override 
+    # built-in arguments if ever possible a plugin has similarly named 
+    # plugin display filters (which it shouldn't!)
+    plugins = cmds.pluginDisplayFilter(query=True, listFilters=True)
+    for plugin in plugins:
+        plugin = str(plugin)  # unicode->str for simplicity of the dict
+        state = cmds.modelEditor(panel, query=True, queryPluginObjects=plugin)
+        viewport_options[plugin] = state
+    
     for key in ViewportOptions:
         viewport_options[key] = cmds.modelEditor(
             panel, query=True, **{key: True})
@@ -410,6 +431,8 @@ def parse_active_scene():
 
     """
 
+    time_control = mel.eval("$gPlayBackSlider = $gPlayBackSlider")
+
     return {
         "start_frame": cmds.playbackOptions(minTime=True, query=True),
         "end_frame": cmds.playbackOptions(maxTime=True, query=True),
@@ -421,7 +444,10 @@ def parse_active_scene():
         "format": cmds.optionVar(query="playblastFormat"),
         "off_screen": (True if cmds.optionVar(query="playblastOffscreen")
                        else False),
-        "quality": cmds.optionVar(query="playblastQuality")
+        "show_ornaments": (True if cmds.optionVar(query="playblastShowOrnaments")
+                       else False),
+        "quality": cmds.optionVar(query="playblastQuality"),
+        "sound": cmds.timeControl(time_control, q=True, sound=True) or None
     }
 
 
@@ -463,6 +489,10 @@ def apply_scene(**options):
     if "off_screen" in options:
         cmds.optionVar(
             intValue=["playblastFormat", options["off_screen"]])
+
+    if "show_ornaments" in options:
+        cmds.optionVar(
+            intValue=["show_ornaments", options["show_ornaments"]])
 
     if "quality" in options:
         cmds.optionVar(
@@ -605,14 +635,22 @@ def _applied_viewport_options(options, panel):
     """Context manager for applying `options` to `panel`"""
 
     options = dict(ViewportOptions, **(options or {}))
-
-    cmds.modelEditor(panel,
-                     edit=True,
-                     allObjects=False,
-                     grid=False,
-                     manipulators=False)
+    
+    # separate the plugin display filter options since they need to
+    # be set differently (see #55)
+    plugins = cmds.pluginDisplayFilter(query=True, listFilters=True)
+    plugin_options = dict()
+    for plugin in plugins:
+        if plugin in options:
+            plugin_options[plugin] = options.pop(plugin)
+    
+    # default options
     cmds.modelEditor(panel, edit=True, **options)
 
+    # plugin display filter options
+    for plugin, state in plugin_options.items():
+        cmds.modelEditor(panel, edit=True, pluginObjects=(plugin, state))
+    
     yield
 
 
@@ -685,6 +723,17 @@ def _maintain_camera(panel, camera):
     finally:
         for camera, renderable in state.iteritems():
             cmds.setAttr(camera + ".rnd", renderable)
+
+
+@contextlib.contextmanager
+def _disabled_inview_messages():
+    """Disable in-view help messages during the context"""
+    original = cmds.optionVar(q="inViewMessageEnable")
+    cmds.optionVar(iv=("inViewMessageEnable", 0))
+    try:
+        yield
+    finally:
+        cmds.optionVar(iv=("inViewMessageEnable", original))
 
 
 def _image_to_clipboard(path):
